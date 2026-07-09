@@ -45,7 +45,7 @@
         relationCard: '.relation-card',
         relationCardAvatar: '.relation-card-avatar[data-user-profile-id], .relation-card-avatar[href*="space.bilibili.com/"]',
         selectedCount: '.relation-content-header__left .selected',
-        nativeFollowButton: 'button, a, div, span, li, .vui_button, .van-button, .bili-btn, .follow-btn, .h-f-btn, .not-follow, .following, .fans-action-btn, .already-btn, .follow_dropdown li',
+        nativeFollowButton: '.follow-btn, .already-btn, .fans-action-btn, .follow_dropdown li, .follow-ctnr, .h-f-btn, .not-follow, .following',
         nativeFollowTrigger: '[data-mid], [data-vmid], [data-user-id], [data-user-mid], [data-user-profile-id], [href*="space.bilibili.com/"], [href*="mid"]',
         videoUpInfoContainer: '.up-info-container',
         videoUpNameLink: '.up-info-container a.up-name[href*="space.bilibili.com/"]',
@@ -427,11 +427,21 @@
      * @returns {boolean}
      */
     function isPotentialFollowButton(element) {
-        if (!element.matches(SELECTORS.nativeFollowButton)) {
+        /**
+         * 这里不能再用“只要在 UP 信息区里、文本又带关注字样”这种宽松判断，
+         * 因为视频页 `.up-info-container` 会把头像、UP 名、发消息等元素都包进去，
+         * 一旦沿祖先链向上匹配到整块容器，就会把这些普通入口误拦截成“打开关注面板”。
+         *
+         * 因此这里改成两层限制：
+         * 1. 当前节点本身是原生关注控件，或位于原生关注控件内部
+         * 2. 文本语义确实是“关注 / 设置分组”
+         */
+        const actionRoot = getNativeFollowActionRoot(element);
+        if (!(actionRoot instanceof HTMLElement)) {
             return false;
         }
 
-        const text = normalizeText(element.textContent);
+        const text = normalizeText(actionRoot.textContent);
         if (!text) {
             return false;
         }
@@ -440,13 +450,23 @@
             return false;
         }
 
-        return Boolean(
-            element.classList.contains('follow-btn')
-            || element.classList.contains('already-btn')
-            || element.closest('.follow-btn')
-            || element.closest('.follow_dropdown')
-            || element.closest(SELECTORS.videoUpInfoContainer)
-        );
+        return true;
+    }
+
+    /**
+     * 找到当前节点所属的原生“关注动作控件根节点”。
+     * 只允许落在真实关注控件内部的点击继续向下处理，
+     * 这样视频页里的头像、UP 名、发消息就不会再被误识别。
+     *
+     * @param {HTMLElement} element
+     * @returns {HTMLElement | null}
+     */
+    function getNativeFollowActionRoot(element) {
+        if (element.matches(SELECTORS.nativeFollowButton)) {
+            return element;
+        }
+
+        return element.closest(SELECTORS.nativeFollowButton);
     }
 
     /**
