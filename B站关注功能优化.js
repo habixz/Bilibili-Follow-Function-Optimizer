@@ -510,6 +510,14 @@
         cleanupManagedFollowButtons();
 
         const originalButtons = collectManagedFollowCandidates();
+        const candidateSet = new Set(originalButtons);
+
+        Array.from(state.managedFollowButtons.keys()).forEach((originalButton) => {
+            if (!candidateSet.has(originalButton)) {
+                restoreManagedFollowButton(originalButton);
+            }
+        });
+
         originalButtons.forEach((originalButton) => {
             if (!(originalButton instanceof HTMLElement)) {
                 return;
@@ -535,7 +543,7 @@
      * @returns {HTMLElement[]}
      */
     function collectManagedFollowCandidates() {
-        const candidates = new Set();
+        const candidatesByScope = new Map();
 
         [
             ...document.querySelectorAll('.up-info__btn-panel .follow-btn'),
@@ -543,12 +551,99 @@
             ...document.querySelectorAll(SELECTORS.spaceHeaderFollowButton),
             ...document.querySelectorAll(SELECTORS.followCardButton)
         ].forEach((node) => {
-            if (node instanceof HTMLElement && !node.classList.contains(CLASS_NAMES.managedFollowButton)) {
-                candidates.add(node);
+            if (!(node instanceof HTMLElement) || node.classList.contains(CLASS_NAMES.managedFollowButton)) {
+                return;
             }
+
+            const scopeKey = getManagedFollowCandidateScopeKey(node);
+            const previousNode = candidatesByScope.get(scopeKey);
+            candidatesByScope.set(
+                scopeKey,
+                choosePreferredManagedFollowCandidate(previousNode, node)
+            );
         });
 
-        return Array.from(candidates);
+        return Array.from(candidatesByScope.values());
+    }
+
+    /**
+     * 生成关注按钮候选节点所属“作用域”的唯一键。
+     * 同一块业务区域里如果因为站内重渲染暂时存在两个原生关注按钮，
+     * 这里会把它们折叠成同一个作用域，后续只保留一个进行接管。
+     *
+     * @param {HTMLElement} button
+     * @returns {string}
+     */
+    function getManagedFollowCandidateScopeKey(button) {
+        const scopeRoot = button.closest([
+            SELECTORS.followCardContainer,
+            SELECTORS.videoUpInfoContainer,
+            SELECTORS.liveAnchorContainer,
+            SELECTORS.spaceHeaderContainer
+        ].join(','));
+
+        const uid = extractUidFromActionTrigger(button);
+        const scopeIdentity = scopeRoot instanceof HTMLElement
+            ? buildElementScopePath(scopeRoot)
+            : buildElementScopePath(button.parentElement || button);
+
+        return `${scopeIdentity}::${Number.isFinite(uid) ? uid : 'unknown'}`;
+    }
+
+    /**
+     * 在同一作用域内挑一个更适合接管的原生按钮。
+     * 优先级如下：
+     * 1. 优先保留不是脚本旧隐藏节点的按钮；
+     * 2. 如果两者条件相同，保留文档顺序更靠后的那个，
+     *    因为站内重渲染时新节点通常会出现在旧节点之后。
+     *
+     * @param {HTMLElement | undefined} previousButton
+     * @param {HTMLElement} nextButton
+     * @returns {HTMLElement}
+     */
+    function choosePreferredManagedFollowCandidate(previousButton, nextButton) {
+        if (!(previousButton instanceof HTMLElement)) {
+            return nextButton;
+        }
+
+        const previousHiddenByScript = previousButton.dataset.bfpoManagedHidden === 'true';
+        const nextHiddenByScript = nextButton.dataset.bfpoManagedHidden === 'true';
+        if (previousHiddenByScript !== nextHiddenByScript) {
+            return previousHiddenByScript ? nextButton : previousButton;
+        }
+
+        const position = previousButton.compareDocumentPosition(nextButton);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+            return nextButton;
+        }
+
+        return previousButton;
+    }
+
+    /**
+     * 为一个节点生成足够稳定的作用域路径。
+     * 这里不依赖随机属性，而是用节点在父层级中的位置来构造，
+     * 便于在同一页面内区分不同的关注按钮容器。
+     *
+     * @param {Element} element
+     * @returns {string}
+     */
+    function buildElementScopePath(element) {
+        const segments = [];
+        let current = element;
+        let depth = 0;
+
+        while (current instanceof Element && depth < 5) {
+            const parent = current.parentElement;
+            const index = parent
+                ? Array.from(parent.children).indexOf(current)
+                : 0;
+            segments.push(`${current.tagName}.${current.className || ''}:${index}`);
+            current = parent;
+            depth += 1;
+        }
+
+        return segments.join('>');
     }
 
     /**
@@ -918,7 +1013,8 @@
             setBusy(true);
             const groups = await loadGroupOptions();
             openSetGroupDialog(groups, [uid], {
-                confirmSuccessMessage: '已完成关注并设置分组，页面即将刷新',
+                confirmSuccessMessage: '已完成关注并设置分组',
+                reloadOnSubmit: false,
                 emptyAction: 'unfollow',
                 emptyButtonText: '取消关注',
                 emptyButtonDanger: true,
@@ -927,6 +1023,7 @@
                 onSubmit: async (selectedUids, finalTagIds) => {
                     await followUser(selectedUids[0]);
                     await setUsersGroups(selectedUids, finalTagIds);
+                    applyFollowSubmitResult(selectedUids);
                 },
                 onEmptySubmit: async () => {}
             });
@@ -957,7 +1054,8 @@
             ]);
             openSetGroupDialog(groups, [uid], {
                 initialCheckedTagIds: currentTagIds,
-                confirmSuccessMessage: '已提交分组设置，页面即将刷新'
+                confirmSuccessMessage: '已提交分组设置',
+                reloadOnSubmit: false
             });
         } catch (error) {
             console.error(`[${SCRIPT_NAME}] 打开设置分组面板失败`, error);
@@ -1101,6 +1199,7 @@
      *   title?: string,
      *   initialCheckedTagIds?: number[],
      *   confirmSuccessMessage?: string,
+     *   reloadOnSubmit?: boolean,
      *   emptyAction?: 'unfollow' | 'close',
      *   emptyButtonText?: string,
      *   emptyButtonDanger?: boolean,
@@ -1229,9 +1328,10 @@
                     } else {
                         await executeBatchUnfollow(selectedUids);
                     }
+                    applyUnfollowSubmitResult(selectedUids);
                     closeActiveOverlay();
-                    showToast(options.emptySuccessMessage || (selectedUids.length === 1 ? '操作已完成，页面即将刷新' : `已取消关注 ${selectedUids.length} 个 UP 主，页面即将刷新`));
-                    if (options.reloadOnEmptySubmit !== false) {
+                    showToast(options.emptySuccessMessage || (selectedUids.length === 1 ? '操作已完成' : `已取消关注 ${selectedUids.length} 个 UP 主`));
+                    if (options.reloadOnEmptySubmit === true) {
                         reloadLater();
                     }
                     return;
@@ -1252,9 +1352,12 @@
                 } else {
                     await setUsersGroups(selectedUids, finalTagIds);
                 }
+                applyGroupSubmitResult(selectedUids, finalTagIds);
                 closeActiveOverlay();
-                showToast(options.confirmSuccessMessage || `已提交 ${selectedUids.length} 个 UP 主的分组设置，页面即将刷新`);
-                reloadLater();
+                showToast(options.confirmSuccessMessage || `已提交 ${selectedUids.length} 个 UP 主的分组设置`);
+                if (options.reloadOnSubmit === true) {
+                    reloadLater();
+                }
             } catch (error) {
                 console.error(`[${SCRIPT_NAME}] 批量设置分组失败`, error);
                 showToast(getErrorMessage(error, '批量设置分组失败'));
@@ -1513,6 +1616,185 @@
                 csrf_token: csrf
             })
         });
+    }
+
+    /**
+     * 在“设置分组”成功后同步一份本地状态。
+     * 这样即使不整页刷新，后续再次打开弹窗时也能直接看到最新预选结果，
+     * 同时把分组列表缓存失效掉，避免分组计数长期停留在旧值。
+     *
+     * @param {number[]} uids
+     * @param {number[]} finalTagIds
+     */
+    function applyGroupSubmitResult(uids, finalTagIds) {
+        const normalizedTagIds = Array.from(new Set(
+            finalTagIds
+                .map((tagId) => Number(tagId))
+                .filter((tagId) => Number.isFinite(tagId))
+        ));
+
+        const nextTagIds = normalizedTagIds.length > 0 ? normalizedTagIds : [DEFAULT_GROUP_TAG_ID];
+        uids.forEach((uid) => {
+            const normalizedUid = Number(uid);
+            if (!Number.isFinite(normalizedUid)) {
+                return;
+            }
+            state.singleUserGroupCache.set(normalizedUid, [...nextTagIds]);
+        });
+
+        state.groupOptionsCache = null;
+        state.groupOptionsCacheAt = 0;
+        injectBatchButtons();
+    }
+
+    /**
+     * 在“先关注再分组”成功后，同步当前页面里的关注按钮状态。
+     * 这里不依赖整页刷新，而是把同 UID 的按钮先切到“已关注”，
+     * 再触发一次镜像按钮重建，让后续点击直接进入“设置分组”流程。
+     *
+     * @param {number[]} uids
+     */
+    function applyFollowSubmitResult(uids) {
+        const uidSet = new Set(
+            uids
+                .map((uid) => Number(uid))
+                .filter((uid) => Number.isFinite(uid))
+        );
+        if (uidSet.size === 0) {
+            return;
+        }
+
+        const candidateButtons = new Set([
+            ...state.managedFollowButtons.keys(),
+            ...collectManagedFollowCandidates(),
+            ...document.querySelectorAll(SELECTORS.nativeFollowButton)
+        ]);
+
+        candidateButtons.forEach((button) => {
+            if (!(button instanceof HTMLElement)) {
+                return;
+            }
+
+            const uid = extractUidFromActionTrigger(button);
+            if (!uidSet.has(uid)) {
+                return;
+            }
+
+            markFollowButtonAsFollowed(button);
+        });
+
+        syncManagedFollowButtons();
+    }
+
+    /**
+     * 把单个关注按钮就地改成“已关注”状态。
+     * 这里优先保留原有类名，只补最关键的语义类和文案，
+     * 尽量减少对 B 站原按钮布局的干扰。
+     *
+     * @param {HTMLElement} button
+     */
+    function markFollowButtonAsFollowed(button) {
+        button.classList.add('following');
+        button.classList.remove('not-follow');
+        button.dataset.curbuttonstrategy = '已关注';
+        button.setAttribute('aria-label', '已关注');
+        button.textContent = '已关注';
+    }
+
+    /**
+     * 在“取消关注”成功后同步当前页面状态。
+     * 这里会把同 UID 的按钮切回“关注”，并在关注页中移除对应卡片，
+     * 从而避免必须靠整页刷新才能看到正确结果。
+     *
+     * @param {number[]} uids
+     */
+    function applyUnfollowSubmitResult(uids) {
+        const uidSet = new Set(
+            uids
+                .map((uid) => Number(uid))
+                .filter((uid) => Number.isFinite(uid))
+        );
+        if (uidSet.size === 0) {
+            return;
+        }
+
+        uidSet.forEach((uid) => {
+            state.singleUserGroupCache.delete(uid);
+        });
+        state.groupOptionsCache = null;
+        state.groupOptionsCacheAt = 0;
+
+        const candidateButtons = new Set([
+            ...state.managedFollowButtons.keys(),
+            ...collectManagedFollowCandidates(),
+            ...document.querySelectorAll(SELECTORS.nativeFollowButton)
+        ]);
+
+        candidateButtons.forEach((button) => {
+            if (!(button instanceof HTMLElement)) {
+                return;
+            }
+
+            const uid = extractUidFromActionTrigger(button);
+            if (!uidSet.has(uid)) {
+                return;
+            }
+
+            markFollowButtonAsUnfollowed(button);
+        });
+
+        removeFollowCardsByUid(uidSet);
+        syncManagedFollowButtons();
+        injectBatchButtons();
+    }
+
+    /**
+     * 把单个关注按钮就地改成“关注”状态。
+     * 这里只补最核心的文案、类名和语义属性，
+     * 让脚本随后重建出来的镜像按钮能稳定识别为未关注态。
+     *
+     * @param {HTMLElement} button
+     */
+    function markFollowButtonAsUnfollowed(button) {
+        button.classList.add('not-follow');
+        button.classList.remove('following');
+        button.dataset.curbuttonstrategy = '关注';
+        button.setAttribute('aria-label', '关注');
+        button.textContent = '关注';
+    }
+
+    /**
+     * 在关注页里移除刚刚取消关注的卡片，并尽量同步头部已选数量显示。
+     * 这样批量取消后，列表会立刻收敛到最新状态，不会留下一批已经失效的卡片。
+     *
+     * @param {Set<number>} uidSet
+     */
+    function removeFollowCardsByUid(uidSet) {
+        if (!(uidSet instanceof Set) || uidSet.size === 0) {
+            return;
+        }
+
+        document.querySelectorAll(SELECTORS.relationCard).forEach((card) => {
+            if (!(card instanceof HTMLElement)) {
+                return;
+            }
+
+            const uid = extractUidFromCard(card);
+            if (!uidSet.has(uid)) {
+                return;
+            }
+
+            card.remove();
+        });
+
+        const selectedCountNode = document.querySelector(SELECTORS.selectedCount);
+        if (selectedCountNode instanceof HTMLElement) {
+            const nextSelectedCount = getSelectedUids().length;
+            const currentText = normalizeText(selectedCountNode.textContent);
+            if (/\d+/.test(currentText)) {
+                selectedCountNode.textContent = currentText.replace(/\d+/, String(nextSelectedCount));
+            }
+        }
     }
 
     /**
