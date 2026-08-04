@@ -263,6 +263,33 @@
     }
 
     /**
+     * 判断一次 DOM 变化是否完全来自 B 站播放器弹幕容器。
+     *
+     * 背景：
+     * 本脚本通过 @match https://*.bilibili.com/* 覆盖了视频页。
+     * 长视频播放时，弹幕 DOM 节点会以极高频率增删，而它们与关注功能无关。
+     * 如果不过滤，整页观察器会被弹幕变化疯狂触发，
+     * 主线程被回调占满后，点击暂停/播放、快捷键等用户输入都会出现明显延迟。
+     *
+     * @param {MutationRecord} mutation
+     * @returns {boolean}
+     */
+    function isDanmakuMutation(mutation) {
+        const danmakuSelector = '.bpx-player-dm-wrap, .bpx-player-dm, [class*="player-dm"]';
+
+        const targetElement = mutation.target instanceof Element ? mutation.target : null;
+        if (targetElement && targetElement.closest(danmakuSelector)) {
+            return true;
+        }
+
+        const affectedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        return affectedNodes.some((node) => (
+            node instanceof Element
+            && (node.closest(danmakuSelector) || node.matches(danmakuSelector))
+        ));
+    }
+
+    /**
      * 判断某一批 DOM 变更是否和关注页功能相关。
      * 这里不再对 document.body 上的所有子树变化都响应，只处理和关注页主体相关的节点。
      *
@@ -270,18 +297,21 @@
      * @returns {boolean}
      */
     function shouldHandleFollowPageMutation(mutationList) {
-        if (isFollowPage()) {
-            return mutationList.some((record) => {
+        return mutationList.some((record) => {
+            // 弹幕节点高频增删与关注功能无关，直接跳过，避免观察器回调拖垮主线程
+            if (isDanmakuMutation(record)) {
+                return false;
+            }
+
+            if (isFollowPage()) {
                 if (isRelevantFollowPageNode(record.target)) {
                     return true;
                 }
 
                 return Array.from(record.addedNodes).some(isRelevantFollowPageNode)
                     || Array.from(record.removedNodes).some(isRelevantFollowPageNode);
-            });
-        }
+            }
 
-        return mutationList.some((record) => {
             if (isRelevantManagedFollowNode(record.target)) {
                 return true;
             }
